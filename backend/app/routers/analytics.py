@@ -1,12 +1,19 @@
 """Analytics router.
 
 All analytics endpoints share a common pattern:
-  1. Fetch games from chess.com (with optional time_class / limit filters).
+  1. Serve games from the in-memory cache (populated on first access and
+     refreshed periodically by the background task in ``main.py``).
   2. Run a pure analytics function over those games.
   3. Return structured results.
 
-Adding new analytics = adding a new endpoint that calls a new function in
-``analytics_engine``.  No changes to the data layer are required.
+Adding new analytics
+--------------------
+1. Define a response schema in ``schemas.py``.
+2. Add a pure function in ``analytics_engine.py`` that accepts
+   ``list[GameSummary]`` and returns your new schema (or a list of it).
+3. Add a new ``@router.get`` endpoint below that calls ``_load_games``
+   and then your new engine function.  No changes to the data layer are
+   required.
 """
 from __future__ import annotations
 
@@ -14,18 +21,42 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app import config
 from app.schemas import ComparisonData, MoveTimeStats, MoveTimeTrendPoint
 from app.services import analytics_engine, chess_com
+from app.services.cache import game_cache
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
 async def _load_games(username: str, time_class: Optional[str], limit: int):
-    """Helper: fetch games and raise 404/502 on error."""
-    try:
-        games = await chess_com.get_user_games(username, time_class=time_class, limit=limit)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Chess.com API error: {exc}") from exc
+    """Return games for *username*, using the in-memory cache when available.
+
+    Side-effects
+    ------------
+    * Calls ``game_cache.touch(username)`` so the background refresh task
+      knows this user is active and should be kept up-to-date.
+    * On a cache miss, fetches up to ``CACHE_MAX_GAMES`` games from
+      chess.com and stores them in the cache before filtering/slicing.
+
+    The in-process ``time_class`` filter and ``limit`` slice are applied
+    *after* retrieval so the cached dataset can serve any combination of
+    query parameters without additional chess.com round-trips.
+    """
+    game_cache.touch(username)
+
+    games = game_cache.get(username)
+    if games is None:
+        try:
+            games = await chess_com.get_user_games(username, limit=config.CACHE_MAX_GAMES)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Chess.com API error: {exc}") from exc
+        game_cache.set(username, games)
+
+    if time_class:
+        games = [g for g in games if g.time_class.lower() == time_class.lower()]
+    games = games[:limit]
+
     if not games:
         raise HTTPException(
             status_code=404,
