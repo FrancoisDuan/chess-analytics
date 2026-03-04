@@ -1,16 +1,18 @@
 # Chess Analytics
 
-A full-stack web application for exploring **time-per-move** analytics from [Chess.com](https://chess.com) games.
+A full-stack web application for exploring **time-per-move** analytics from [Chess.com](https://chess.com) and [Lichess](https://lichess.org) games.
 
 ## Features
 
 | Endpoint / Feature | Description |
 |--------------------|-------------|
-| Fetch games | Retrieve all (or filtered) games for any chess.com username |
+| Fetch games | Retrieve all (or filtered) games for any Chess.com username |
 | Filter by time class | `blitz`, `rapid`, `bullet`, `daily`, `classical` |
 | Move-time stats | For each move number: avg / median / P25 / P75 seconds |
 | Move-time trend | How time-per-move has evolved over calendar dates |
 | Compare two players | Side-by-side move-time stats for two usernames |
+| **Per-move analysis** | Per-move accuracy, criticality, and combined metric via Lichess cloud evals |
+| **Platform support** | Chess.com and Lichess via a unified endpoint |
 | **Auto-refresh** | Game data for recently-active users is refreshed automatically in the background |
 
 ---
@@ -28,8 +30,10 @@ chess-analytics/
 │   │   │   ├── games.py       # GET /api/games/{username}
 │   │   │   └── analytics.py   # GET /api/analytics/…
 │   │   └── services/
-│   │       ├── cache.py           # In-memory game cache + activity tracker
-│   │       ├── chess_com.py       # Chess.com API client + PGN parser
+│   │       ├── cache.py           # Platform-aware in-memory game cache + activity tracker
+│   │       ├── chess_com.py       # Chess.com API client + PGN parser (python-chess)
+│   │       ├── lichess.py         # Lichess API client (NDJSON stream)
+│   │       ├── lichess_eval.py    # Lichess cloud eval client with TTL FEN cache
 │   │       └── analytics_engine.py # Pure analytics functions (extend here)
 │   ├── tests/
 │   └── requirements.txt
@@ -187,6 +191,53 @@ GET /api/analytics/compare/{username1}/{username2}
   ?time_class=blitz
   ?limit=100
   ?move_limit=20
+
+GET /api/analytics/{platform}/{username}/per-move
+  ?n_games=20              # most-recent N games to analyse (1–1000, default 20)
+  ?time_class=blitz        # filter by time class
+  ?with_eval=true          # fetch Lichess cloud evals (default true)
+
+  # Date filtering – use window_days OR since/until (ISO datetime):
+  ?window_days=7           # only games from last 7 days
+  ?since=2024-01-01        # only games on/after this date
+  ?until=2024-12-31        # only games on/before this date
 ```
+
+**Platform values:**
+* `chessdotcom` – Chess.com
+* `lichess` – Lichess
+
+**Per-move response shape:**
+```json
+{
+  "platform": "lichess",
+  "username": "alice",
+  "games_analyzed": 10,
+  "moves": [
+    {
+      "game_url": "https://lichess.org/ABCD1234",
+      "game_end_time": 1700000000,
+      "ply": 3,
+      "move_number": 2,
+      "color": "white",
+      "san": "Nf3",
+      "time_spent": 7.5,
+      "normalized_time": 1.25,
+      "eval_before": 15.0,
+      "eval_after": 10.0,
+      "accuracy": 0.94,
+      "criticality": 0.90,
+      "combined_metric": 96.2
+    }
+  ]
+}
+```
+
+Field notes:
+* `normalized_time` – `time_spent` divided by the player's median time per move within that game; `null` when clock data is missing.
+* `eval_before` / `eval_after` – centipawns from White's perspective (positive = White is better); `null` when the position is absent from the Lichess cloud database.
+* `accuracy` (0–1) – move quality using a Lichess-style formula; `null` when evals are unavailable.
+* `criticality` (0–1) – how balanced the position is before the move; `null` when evals are unavailable.
+* `combined_metric` (0–100) – weighted combination of accuracy (boosted in critical positions) with an optional small time-efficiency component; `null` when accuracy is unavailable.
 
 Interactive docs at **http://localhost:8000/docs** after starting the backend.

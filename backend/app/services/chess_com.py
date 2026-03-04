@@ -4,10 +4,13 @@ Fetches monthly game archives and parses per-move clock times from PGN.
 """
 from __future__ import annotations
 
+import io
 import re
 from datetime import datetime, timezone
 from typing import Optional
 
+import chess
+import chess.pgn
 import httpx
 
 from app.schemas import GameSummary, MoveClockEntry
@@ -34,12 +37,70 @@ def _parse_clock(annotation: str) -> Optional[float]:
 def _extract_move_clocks(pgn: str) -> list[MoveClockEntry]:
     """Parse PGN text and return a MoveClockEntry per half-move that has a clock.
 
-    Matches patterns like:
-      ``1. e4 { [%clk 0:05:00] }``   – white move
-      ``1... e5 { [%clk 0:05:00] }`` – black move
+    Uses python-chess to walk through the game so that SAN notation and the FEN
+    after each move can be captured alongside the clock information.
+
+    Falls back to the legacy regex parser if python-chess cannot read the PGN.
     """
-    # Each half-move: MOVENUM followed by dots (. = white, ... = black),
-    # then the SAN token, then a comment containing [%clk H:MM:SS.f].
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn))
+    except Exception:
+        game = None
+
+    if game is not None:
+        return _extract_move_clocks_pgn(game)
+
+    # Fallback: regex-only (no SAN / FEN, but clock values are correct).
+    return _extract_move_clocks_regex(pgn)
+
+
+def _extract_move_clocks_pgn(game: chess.pgn.Game) -> list[MoveClockEntry]:
+    """Walk a parsed python-chess game and build MoveClockEntry objects."""
+    entries: list[MoveClockEntry] = []
+    board = game.board()
+    prev_clock: dict[str, Optional[float]] = {"white": None, "black": None}
+    ply = 0
+
+    for node in game.mainline():
+        color = "white" if board.turn == chess.WHITE else "black"
+        move_number = board.fullmove_number
+        san = board.san(node.move)
+        board.push(node.move)
+        fen_after = board.fen()
+        ply += 1
+
+        clock_val = _parse_clock(node.comment)
+        if clock_val is None:
+            # Skip half-moves that carry no clock annotation.
+            # Note: ply is still incremented so that the ply field in each
+            # returned entry reflects the actual half-move position in the
+            # game (not just a sequential counter over clock-annotated moves).
+            continue
+
+        spent: Optional[float] = None
+        if prev_clock[color] is not None:
+            diff = prev_clock[color] - clock_val  # type: ignore[operator]
+            if diff >= 0:
+                spent = diff
+
+        entries.append(
+            MoveClockEntry(
+                ply=ply,
+                move_number=move_number,
+                color=color,
+                clock_after=clock_val,
+                time_spent=spent,
+                san=san,
+                fen_after=fen_after,
+            )
+        )
+        prev_clock[color] = clock_val
+
+    return entries
+
+
+def _extract_move_clocks_regex(pgn: str) -> list[MoveClockEntry]:
+    """Legacy regex-based clock extractor (no SAN / FEN)."""
     half_move_re = re.compile(
         r"(\d+)(\.{1,3})\s+\S+\s*"  # move-number, dots, SAN
         r"\{[^}]*\[%clk\s+(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)\][^}]*\}"  # clock comment

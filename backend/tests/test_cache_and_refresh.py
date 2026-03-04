@@ -80,11 +80,11 @@ class TestGameCacheActivity:
 
     def test_touch_marks_user_active(self):
         self.cache.touch("alice")
-        assert "alice" in self.cache.get_active_usernames(within_days=1)
+        assert "chessdotcom:alice" in self.cache.get_active_usernames(within_days=1)
 
     def test_touch_is_case_insensitive(self):
         self.cache.touch("Alice")
-        assert "alice" in self.cache.get_active_usernames(within_days=1)
+        assert "chessdotcom:alice" in self.cache.get_active_usernames(within_days=1)
 
     def test_no_touch_returns_empty(self):
         assert self.cache.get_active_usernames(within_days=7) == []
@@ -92,19 +92,19 @@ class TestGameCacheActivity:
     def test_stale_user_excluded(self):
         # Manually back-date the last_seen timestamp to 10 days ago.
         self.cache.touch("alice")
-        self.cache._last_seen["alice"] = time.time() - 10 * 86400
+        self.cache._last_seen["chessdotcom:alice"] = time.time() - 10 * 86400
         assert self.cache.get_active_usernames(within_days=7) == []
 
     def test_recent_user_included(self):
         self.cache.touch("bob")
-        self.cache._last_seen["bob"] = time.time() - 3 * 86400  # 3 days ago
-        assert "bob" in self.cache.get_active_usernames(within_days=7)
+        self.cache._last_seen["chessdotcom:bob"] = time.time() - 3 * 86400  # 3 days ago
+        assert "chessdotcom:bob" in self.cache.get_active_usernames(within_days=7)
 
     def test_multiple_users(self):
         self.cache.touch("alice")
         self.cache.touch("bob")
         active = self.cache.get_active_usernames(within_days=1)
-        assert set(active) == {"alice", "bob"}
+        assert set(active) == {"chessdotcom:alice", "chessdotcom:bob"}
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ async def test_background_refresh_skips_inactive_users():
     ):
         # "stale" was last seen 10 days ago – outside the 1-day window.
         game_cache.touch("stale")
-        game_cache._last_seen["stale"] = time.time() - 10 * 86400
+        game_cache._last_seen["chessdotcom:stale"] = time.time() - 10 * 86400
 
         task = asyncio.create_task(_background_refresh())
         await asyncio.sleep(0.05)
