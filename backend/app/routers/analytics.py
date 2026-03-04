@@ -17,20 +17,62 @@ Adding new analytics
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 
 from app import config
-from app.schemas import ComparisonData, MoveTimeStats, MoveTimeTrendPoint
-from app.services import analytics_engine, chess_com
+from app.schemas import ComparisonData, MoveTimeStats, MoveTimeTrendPoint, PerMoveResponse
+from app.services import analytics_engine, chess_com, lichess
 from app.services.cache import game_cache
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
+_SUPPORTED_PLATFORMS = ("chessdotcom", "lichess")
+
+
+def _parse_date_filters(
+    window_days: Optional[int],
+    since: Optional[str],
+    until: Optional[str],
+) -> tuple[Optional[int], Optional[int]]:
+    """Convert date-filter query params to Unix timestamps (seconds).
+
+    Priority: ``window_days`` > ``since`` / ``until``.
+    Returns ``(since_ts, until_ts)`` where either may be ``None``.
+    """
+    since_ts: Optional[int] = None
+    until_ts: Optional[int] = None
+
+    if window_days is not None:
+        since_ts = int(
+            (datetime.now(timezone.utc) - timedelta(days=window_days)).timestamp()
+        )
+    else:
+        if since:
+            try:
+                dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                since_ts = int(dt.timestamp())
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid 'since' datetime: {since}"
+                ) from exc
+        if until:
+            try:
+                dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+                until_ts = int(dt.timestamp())
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid 'until' datetime: {until}"
+                ) from exc
+
+    return since_ts, until_ts
+
 
 async def _load_games(username: str, time_class: Optional[str], limit: int):
-    """Return games for *username*, using the in-memory cache when available.
+    """Return games for *username* (Chess.com), using the in-memory cache when available.
 
     Side-effects
     ------------
@@ -61,6 +103,52 @@ async def _load_games(username: str, time_class: Optional[str], limit: int):
         raise HTTPException(
             status_code=404,
             detail=f"No games found for user '{username}'"
+            + (f" with time_class='{time_class}'" if time_class else ""),
+        )
+    return games
+
+
+async def _load_games_platform(
+    platform: str,
+    username: str,
+    time_class: Optional[str],
+    limit: int,
+    since_ts: Optional[int],
+    until_ts: Optional[int],
+):
+    """Return games for *username* on *platform*, using platform-aware cache.
+
+    Applies date (since/until), time_class, and limit filters after retrieval
+    so the full cached dataset can serve varied query combinations.
+    """
+    game_cache.touch(username, platform=platform)
+
+    games = game_cache.get(username, platform=platform)
+    if games is None:
+        try:
+            if platform == "chessdotcom":
+                games = await chess_com.get_user_games(username, limit=config.CACHE_MAX_GAMES)
+            else:  # lichess
+                games = await lichess.get_user_games(username, limit=config.CACHE_MAX_GAMES)
+        except Exception as exc:
+            platform_label = "Chess.com" if platform == "chessdotcom" else "Lichess"
+            raise HTTPException(
+                status_code=502, detail=f"{platform_label} API error: {exc}"
+            ) from exc
+        game_cache.set(username, games, platform=platform)
+
+    if since_ts is not None:
+        games = [g for g in games if g.end_time >= since_ts]
+    if until_ts is not None:
+        games = [g for g in games if g.end_time <= until_ts]
+    if time_class:
+        games = [g for g in games if g.time_class.lower() == time_class.lower()]
+    games = games[:limit]
+
+    if not games:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No games found for user '{username}' on platform '{platform}'"
             + (f" with time_class='{time_class}'" if time_class else ""),
         )
     return games
@@ -127,4 +215,91 @@ async def compare_users(
         username2=username2,
         move_time_stats1=stats1,
         move_time_stats2=stats2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-move analysis endpoint (platform-aware)
+# ---------------------------------------------------------------------------
+
+@router.get("/{platform}/{username}/per-move", response_model=PerMoveResponse)
+async def per_move_analysis(
+    platform: str,
+    username: str,
+    n_games: int = Query(
+        default=20,
+        ge=1,
+        le=1000,
+        description="Number of most-recent games to analyse",
+    ),
+    time_class: Optional[str] = Query(
+        default=None,
+        description="blitz | rapid | bullet | daily | classical",
+    ),
+    window_days: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="Limit to games played within the last N days (overrides since/until)",
+    ),
+    since: Optional[str] = Query(
+        default=None,
+        description="Include games played on or after this ISO datetime (e.g. 2024-01-01)",
+    ),
+    until: Optional[str] = Query(
+        default=None,
+        description="Include games played on or before this ISO datetime (e.g. 2024-12-31)",
+    ),
+    with_eval: bool = Query(
+        default=True,
+        description="Fetch Lichess cloud evaluations to compute accuracy and criticality",
+    ),
+):
+    """Return per-move analysis for *username*'s most recent *n_games* games.
+
+    Platform
+    --------
+    * ``chessdotcom`` – Chess.com
+    * ``lichess``     – Lichess
+
+    Each move in the response includes:
+    * ``time_spent`` / ``normalized_time`` (relative to player median in that game)
+    * ``eval_before`` / ``eval_after`` centipawns (white perspective, from Lichess cloud)
+    * ``accuracy`` (0–1), ``criticality`` (0–1), ``combined_metric`` (0–100)
+    * Identifiers: ``game_url``, ``game_end_time``, ``ply``, ``move_number``,
+      ``color``, ``san``
+
+    Eval-derived fields are ``null`` when the position is absent from the
+    Lichess cloud database or ``with_eval=false`` is passed.
+
+    Date filtering
+    --------------
+    Pass ``window_days`` **or** ``since`` / ``until`` to restrict the games
+    included.  The backend applies the filter; the frontend can do additional
+    aggregation on the returned data.
+    """
+    platform_lower = platform.lower()
+    if platform_lower not in _SUPPORTED_PLATFORMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported platform '{platform}'. Use 'chessdotcom' or 'lichess'.",
+        )
+
+    since_ts, until_ts = _parse_date_filters(window_days, since, until)
+    games = await _load_games_platform(
+        platform_lower, username, time_class, n_games, since_ts, until_ts
+    )
+
+    if with_eval:
+        async with httpx.AsyncClient() as eval_client:
+            moves = await analytics_engine.compute_per_move_analysis(
+                games, username, eval_client=eval_client
+            )
+    else:
+        moves = await analytics_engine.compute_per_move_analysis(games, username)
+
+    return PerMoveResponse(
+        platform=platform_lower,
+        username=username,
+        games_analyzed=len(games),
+        moves=moves,
     )

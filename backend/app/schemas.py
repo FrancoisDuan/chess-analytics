@@ -13,6 +13,8 @@ class MoveClockEntry(BaseModel):
     color: str  # "white" or "black"
     clock_after: float  # seconds remaining on clock after this move
     time_spent: Optional[float] = None  # seconds spent on this move (None for first move if no start clock)
+    san: Optional[str] = None  # SAN notation of the move
+    fen_after: Optional[str] = None  # FEN string of the position after this move
 
 
 class GameSummary(BaseModel):
@@ -61,3 +63,30 @@ class ComparisonData(BaseModel):
     username2: str
     move_time_stats1: list[MoveTimeStats]
     move_time_stats2: list[MoveTimeStats]
+
+
+class PerMoveEntry(BaseModel):
+    """Per-move analysis for a single half-move in a game."""
+
+    game_url: str
+    game_end_time: int  # Unix timestamp
+    ply: int  # half-move number within the game
+    move_number: int  # full-move number (1-based)
+    color: str  # "white" or "black"
+    san: Optional[str] = None  # SAN notation
+    time_spent: Optional[float] = None  # seconds spent on this move
+    normalized_time: Optional[float] = None  # time_spent / player median time per move
+    eval_before: Optional[float] = None  # centipawns (white perspective) before the move
+    eval_after: Optional[float] = None  # centipawns (white perspective) after the move
+    accuracy: Optional[float] = None  # 0.0–1.0 move quality score
+    criticality: Optional[float] = None  # 0.0–1.0 position criticality
+    combined_metric: Optional[float] = None  # 0–100 combined score
+
+
+class PerMoveResponse(BaseModel):
+    """Response for the per-move analysis endpoint."""
+
+    platform: str  # "chessdotcom" or "lichess"
+    username: str
+    games_analyzed: int
+    moves: list[PerMoveEntry]
